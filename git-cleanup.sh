@@ -12,6 +12,10 @@ if ! command -v gum &> /dev/null; then
   exit 1
 fi
 
+short_age() {
+  echo "$1" | sed -E -e 's/ years?/y/g' -e 's/ months?/mo/g' -e 's/ weeks?/w/g' -e 's/ days?/d/g' -e 's/ hours?/h/g' -e 's/ minutes?/min/g' -e 's/ seconds?/s/g' -e 's/ ago//' -e 's/, / /g'
+}
+
 MAIN_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
 MAIN_BRANCH="${MAIN_BRANCH:-master}"
 current_branch=$(git symbolic-ref --short HEAD)
@@ -124,30 +128,83 @@ while true; do
         break
       fi
 
-      # Build branch list with dates for display, last-selected branch first
+      # Build branch list with summary info, last-selected branch first
       branch_display=()
+      branch_names=()
       last_display=""
+      last_name=""
+
+      # Find max branch name length for alignment
+      max_len=0
       for b in "${branches[@]}"; do
-        b_date=$(git log -1 --format="%ar" "$b" 2>/dev/null || echo "unknown")
-        if [[ "$b" == "$last_selected" ]]; then
-          last_display="$b ($b_date)"
+        (( ${#b} > max_len )) && max_len=${#b}
+      done
+
+      for b in "${branches[@]}"; do
+        b_age=$(short_age "$(git log -1 --format="%ar" "$b" 2>/dev/null || echo "unknown")")
+        b_merge_base=$(git merge-base "$MAIN_BRANCH" "$b" 2>/dev/null || echo "")
+        if [ -n "$b_merge_base" ]; then
+          b_commits=$(git log --oneline "$b_merge_base".."$b" | wc -l | tr -d ' ')
+          if git merge-base --is-ancestor "$b" "$MAIN_BRANCH" 2>/dev/null; then
+            b_status="MERGED"
+          elif [ "$b_commits" -eq 0 ]; then
+            b_status="EMPTY"
+          else
+            # Check for squash merge: are the branch's file changes already in main?
+            b_changed=$(git diff --name-only "$b_merge_base".."$b" 2>/dev/null)
+            if [ -n "$b_changed" ] && git diff --quiet "$b" "$MAIN_BRANCH" -- $b_changed 2>/dev/null; then
+              b_status="MERGED"
+            else
+              b_status="$b_commits commits"
+            fi
+          fi
         else
-          branch_display+=("$b ($b_date)")
+          b_commits=0
+          b_status="—"
+        fi
+        b_remote=$(git config "branch.${b}.remote" 2>/dev/null || true)
+        if [ -n "$b_remote" ]; then
+          if git rev-parse --verify "refs/remotes/${b_remote}/${b}" &>/dev/null; then
+            b_remote_status="origin"
+          else
+            b_remote_status="remote gone"
+          fi
+        else
+          b_remote_status="local"
+        fi
+
+        line=$(printf "%-${max_len}s  %-14s  %-12s  %s" "$b" "$b_age" "$b_status" "$b_remote_status")
+        if [[ "$b" == "$last_selected" ]]; then
+          last_display="$line"
+          last_name="$b"
+        else
+          branch_display+=("$line")
+          branch_names+=("$b")
         fi
       done
       if [[ -n "$last_display" ]]; then
         branch_display=("$last_display" "${branch_display[@]}")
+        branch_names=("$last_name" "${branch_names[@]}")
       fi
 
+      header=$(printf "  %-${max_len}s  %-14s  %-12s  %s" "Branch" "Age" "Status" "Remote")
       selected=$(printf '%s\n' "Review all branches" "${branch_display[@]}" \
-        | gum choose --header "Select a branch or review all" || true)
+        | gum choose --header "$header" || true)
       [[ -z "$selected" ]] && break
 
       if [[ "$selected" == "Review all branches" ]]; then
         review_branches=("${branches[@]}")
       else
-        review_branches=("$(echo "$selected" | sed 's/ (.*//')")
-        last_selected="${review_branches[0]}"
+        # Match selection back to branch name by index
+        selected_branch=""
+        for j in "${!branch_display[@]}"; do
+          if [[ "${branch_display[$j]}" == "$selected" ]]; then
+            selected_branch="${branch_names[$j]}"
+            break
+          fi
+        done
+        review_branches=("$selected_branch")
+        last_selected="$selected_branch"
       fi
 
       total=${#review_branches[@]}
