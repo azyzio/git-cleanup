@@ -24,14 +24,14 @@ while true; do
 
   echo ""
   mode=$(gum choose \
-    "Stash cleanup ($stash_count stashes)" \
     "Branch cleanup ($branch_count branches)" \
+    "Stash cleanup ($stash_count stashes)" \
     "Exit" \
-    --header "What do you want to clean up?")
+    --header "What do you want to clean up?" || true)
 
   # ─── Exit ─────────────────────────────────────────────────────────────
 
-  if [[ "$mode" == Exit ]]; then
+  if [[ -z "$mode" || "$mode" == Exit ]]; then
     break
   fi
 
@@ -65,7 +65,8 @@ while true; do
       fi
       echo ""
 
-      action=$(gum choose "Keep" "Drop" "Check conflicts with $MAIN_BRANCH" "Quit" --header "What to do with this stash?")
+      action=$(gum choose "Keep" "Drop" "Check conflicts with $MAIN_BRANCH" "Quit" --header "What to do with this stash?" || true)
+      [[ -z "$action" ]] && break
 
       case "$action" in
         Drop)
@@ -104,204 +105,219 @@ while true; do
   # ─── Branch Cleanup ───────────────────────────────────────────────────
 
   if [[ "$mode" == Branch* ]]; then
-    # Collect all branches
-    branches=()
-    while IFS= read -r branch; do
-      branches+=("$branch")
-    done < <(git branch --format='%(refname:short)' | grep -v "^${MAIN_BRANCH}$" | grep -v "^${current_branch}$" | while read -r b; do
-      echo "$(git log -1 --format='%ct' "$b") $b"
-    done | sort -rn | cut -d' ' -f2-)
-
-    total=${#branches[@]}
-    if [ "$total" -eq 0 ]; then
-      gum style --foreground 2 "No branches to review."
-      continue
-    fi
-
-    # Choose: review all or pick a specific branch
-    branch_mode=$(gum choose \
-      "Review all branches" \
-      "Pick a specific branch" \
-      --header "How do you want to review?")
-
-    review_branches=("${branches[@]}")
-
-    if [[ "$branch_mode" == Pick* ]]; then
-      # Build list with dates for display
-      branch_list=""
-      for b in "${branches[@]}"; do
-        b_date=$(git log -1 --format="%ar" "$b" 2>/dev/null || echo "unknown")
-        branch_list+="$b ($b_date)"$'\n'
-      done
-      selected=$(echo "$branch_list" | sed '/^$/d' | fzf --no-sort --header "Select a branch")
-      selected=$(echo "$selected" | sed 's/ (.*//')
-      if [ -z "$selected" ]; then
-        continue
-      fi
-      review_branches=("$selected")
-    fi
-
-    total=${#review_branches[@]}
     deleted=0
     kept=0
+    last_selected=""
+    quit_branches=false
 
-    for i in "${!review_branches[@]}"; do
-      branch="${review_branches[$i]}"
-      idx=$((i + 1))
+    while true; do
+      # Collect all branches (refresh each iteration to reflect deletions)
+      branches=()
+      while IFS= read -r branch; do
+        branches+=("$branch")
+      done < <(git branch --format='%(refname:short)' | grep -v "^${MAIN_BRANCH}$" | grep -v "^${current_branch}$" | while read -r b; do
+        echo "$(git log -1 --format='%ct' "$b") $b"
+      done | sort -rn | cut -d' ' -f2-)
 
-      # ── Gather info ──
-
-      branch_date=$(git log -1 --format="%ad" --date=short "$branch")
-      branch_age=$(git log -1 --format="%ar" "$branch")
-
-      merge_base=$(git merge-base "$MAIN_BRANCH" "$branch" 2>/dev/null || echo "")
-      if [ -z "$merge_base" ]; then
-        continue
+      if [ ${#branches[@]} -eq 0 ]; then
+        gum style --foreground 2 "No branches to review."
+        break
       fi
 
-      # Status
-      commit_count=$(git log --oneline "$merge_base".."$branch" | wc -l | tr -d ' ')
-      is_merged=false
-      if git merge-base --is-ancestor "$branch" "$MAIN_BRANCH" 2>/dev/null; then
-        is_merged=true
+      # Build branch list with dates for display, last-selected branch first
+      branch_display=()
+      last_display=""
+      for b in "${branches[@]}"; do
+        b_date=$(git log -1 --format="%ar" "$b" 2>/dev/null || echo "unknown")
+        if [[ "$b" == "$last_selected" ]]; then
+          last_display="$b ($b_date)"
+        else
+          branch_display+=("$b ($b_date)")
+        fi
+      done
+      if [[ -n "$last_display" ]]; then
+        branch_display=("$last_display" "${branch_display[@]}")
       fi
 
-      if [ "$commit_count" -eq 0 ]; then
-        status="EMPTY"
-        status_color=3
-      elif [ "$is_merged" = true ]; then
-        status="MERGED"
-        status_color=3
+      selected=$(printf '%s\n' "Review all branches" "${branch_display[@]}" \
+        | gum choose --header "Select a branch or review all" || true)
+      [[ -z "$selected" ]] && break
+
+      if [[ "$selected" == "Review all branches" ]]; then
+        review_branches=("${branches[@]}")
       else
-        # Check for squash merge: are the branch's file changes already in master?
-        changed_files=$(git diff --name-only "$merge_base".."$branch" 2>/dev/null)
-        if [ -n "$changed_files" ] && git diff --quiet "$branch" "$MAIN_BRANCH" -- $changed_files 2>/dev/null; then
-          status="MERGED (squash)"
+        review_branches=("$(echo "$selected" | sed 's/ (.*//')")
+        last_selected="${review_branches[0]}"
+      fi
+
+      total=${#review_branches[@]}
+
+      for i in "${!review_branches[@]}"; do
+        branch="${review_branches[$i]}"
+        idx=$((i + 1))
+
+        # ── Gather info ──
+
+        branch_date=$(git log -1 --format="%ad" --date=short "$branch")
+        branch_age=$(git log -1 --format="%ar" "$branch")
+
+        merge_base=$(git merge-base "$MAIN_BRANCH" "$branch" 2>/dev/null || echo "")
+        if [ -z "$merge_base" ]; then
+          continue
+        fi
+
+        # Status
+        commit_count=$(git log --oneline "$merge_base".."$branch" | wc -l | tr -d ' ')
+        is_merged=false
+        if git merge-base --is-ancestor "$branch" "$MAIN_BRANCH" 2>/dev/null; then
+          is_merged=true
+        fi
+
+        if [ "$commit_count" -eq 0 ]; then
+          status="EMPTY"
           status_color=3
-        elif command -v gh &>/dev/null; then
-          # Ask GitHub if this branch has a merged PR
-          pr_info=$(gh pr list --head "$branch" --state merged --limit 1 --json number,title 2>/dev/null || echo "[]")
-          if [ "$pr_info" != "[]" ]; then
-            pr_number=$(echo "$pr_info" | sed -n 's/.*"number":\([0-9]*\).*/\1/p')
-            pr_title=$(echo "$pr_info" | sed -n 's/.*"title":"\([^"]*\)".*/\1/p')
-            status="MERGED via PR #${pr_number}: ${pr_title}"
+        elif [ "$is_merged" = true ]; then
+          status="MERGED"
+          status_color=3
+        else
+          # Check for squash merge: are the branch's file changes already in master?
+          changed_files=$(git diff --name-only "$merge_base".."$branch" 2>/dev/null)
+          if [ -n "$changed_files" ] && git diff --quiet "$branch" "$MAIN_BRANCH" -- $changed_files 2>/dev/null; then
+            status="MERGED (squash)"
             status_color=3
+          elif command -v gh &>/dev/null; then
+            # Ask GitHub if this branch has a merged PR
+            pr_info=$(gh pr list --head "$branch" --state merged --limit 1 --json number,title 2>/dev/null || echo "[]")
+            if [ "$pr_info" != "[]" ]; then
+              pr_number=$(echo "$pr_info" | sed -n 's/.*"number":\([0-9]*\).*/\1/p')
+              pr_title=$(echo "$pr_info" | sed -n 's/.*"title":"\([^"]*\)".*/\1/p')
+              status="MERGED via PR #${pr_number}: ${pr_title}"
+              status_color=3
+            else
+              status="ACTIVE ($commit_count commits)"
+              status_color=2
+            fi
           else
             status="ACTIVE ($commit_count commits)"
             status_color=2
           fi
-        else
-          status="ACTIVE ($commit_count commits)"
-          status_color=2
         fi
-      fi
 
-      # Remote
-      remote_ref=$(git config "branch.${branch}.remote" 2>/dev/null || true)
-      if [ -n "$remote_ref" ]; then
-        if git rev-parse --verify "refs/remotes/${remote_ref}/${branch}" &>/dev/null; then
-          remote_status="pushed to $remote_ref"
-        else
-          remote_status="remote deleted"
-        fi
-      else
-        remote_status="local only"
-      fi
-
-      # Stashes
-      stash_lines=$(git stash list | grep "on ${branch}:" || true)
-      stash_count=0
-      [ -n "$stash_lines" ] && stash_count=$(echo "$stash_lines" | grep -c ".")
-
-      # ── Display ──
-
-      echo ""
-      gum style --bold --foreground 6 "[$idx/$total] $branch"
-      echo ""
-      gum style --foreground "$status_color" "  Status:      $status"
-      echo "  Last commit: $branch_date ($branch_age)"
-      echo "  Remote:      $remote_status"
-      if [ "$stash_count" -gt 0 ]; then
-        gum style --foreground 6 "  Stashes: $stash_count"
-      fi
-
-      # Commits
-      if [ "$commit_count" -gt 0 ]; then
-        echo ""
-        gum style --faint "  Commits:"
-        git log --oneline --format="    %h %s" "$merge_base".."$branch" | head -10 || true
-        if [ "$commit_count" -gt 10 ]; then
-          gum style --faint "    ... and $((commit_count - 10)) more"
-        fi
-      fi
-
-      # Diff stat
-      if [ "$commit_count" -gt 0 ]; then
-        echo ""
-        gum style --faint "  Changes:"
-        git diff --stat --color=always "$merge_base".."$branch" | sed 's/^/    /' | tail -5 || true
-      fi
-
-      echo ""
-
-      # ── Action ──
-
-      action=$(gum choose "Keep" "Delete" "Checkout" "Show full diff" "Quit" --header "What to do with this branch?")
-
-      case "$action" in
-        Delete)
-          git branch -D "$branch" > /dev/null
-          gum style --foreground 1 "Deleted."
-          deleted=$((deleted + 1))
-          ;;
-        Keep)
-          gum style --foreground 2 "Kept."
-          kept=$((kept + 1))
-          ;;
-        Checkout)
-          git checkout "$branch"
-          gum style --foreground 2 "Switched to $branch."
-          exit 0
-          ;;
-        "Show full diff")
-          echo ""
-          git diff --color=always "$merge_base".."$branch" | head -200 || true
-          diff_total=$(git diff "$merge_base".."$branch" | wc -l | tr -d ' ' || true)
-          if [ "$diff_total" -gt 200 ]; then
-            gum style --foreground 3 "... ($((diff_total - 200)) more lines, showing first 200)"
+        # Remote
+        remote_ref=$(git config "branch.${branch}.remote" 2>/dev/null || true)
+        if [ -n "$remote_ref" ]; then
+          if git rev-parse --verify "refs/remotes/${remote_ref}/${branch}" &>/dev/null; then
+            remote_status="pushed to $remote_ref"
+          else
+            remote_status="remote deleted"
           fi
+        else
+          remote_status="local only"
+        fi
+
+        # Stashes
+        stash_lines=$(git stash list | grep "on ${branch}:" || true)
+        stash_count=0
+        [ -n "$stash_lines" ] && stash_count=$(echo "$stash_lines" | grep -c ".")
+
+        # ── Display ──
+
+        echo ""
+        gum style --bold --foreground 6 "[$idx/$total] $branch"
+        echo ""
+        gum style --foreground "$status_color" "  Status:      $status"
+        echo "  Last commit: $branch_date ($branch_age)"
+        echo "  Remote:      $remote_status"
+        if [ "$stash_count" -gt 0 ]; then
+          gum style --foreground 6 "  Stashes: $stash_count"
+        fi
+
+        # Commits
+        if [ "$commit_count" -gt 0 ]; then
           echo ""
-          # Re-prompt after showing diff
-          action2=$(gum choose "Keep" "Delete" "Checkout" "Quit" --header "What to do with this branch?")
-          case "$action2" in
-            Delete)
-              git branch -D "$branch" > /dev/null
-              gum style --foreground 1 "Deleted."
-              deleted=$((deleted + 1))
-              ;;
-            Keep)
-              gum style --foreground 2 "Kept."
-              kept=$((kept + 1))
-              ;;
-            Checkout)
-              git checkout "$branch"
-              gum style --foreground 2 "Switched to $branch."
-              exit 0
-              ;;
-            Quit)
-              gum style --foreground 3 "Skipping remaining branches."
-              break
-              ;;
-          esac
-          ;;
-        Quit)
-          gum style --foreground 3 "Skipping remaining branches."
-          break
-          ;;
-      esac
+          gum style --faint "  Commits:"
+          git log --oneline --format="    %h %s" "$merge_base".."$branch" | head -10 || true
+          if [ "$commit_count" -gt 10 ]; then
+            gum style --faint "    ... and $((commit_count - 10)) more"
+          fi
+        fi
+
+        # Diff stat
+        if [ "$commit_count" -gt 0 ]; then
+          echo ""
+          gum style --faint "  Changes:"
+          git diff --stat --color=always "$merge_base".."$branch" | sed 's/^/    /' | tail -5 || true
+        fi
+
+        echo ""
+
+        # ── Action ──
+
+        action=$(gum choose "Keep" "Delete" "Checkout" "Show full diff" "Quit" --header "What to do with this branch?" || true)
+        [[ -z "$action" ]] && break
+
+        case "$action" in
+          Delete)
+            git branch -D "$branch" > /dev/null
+            gum style --foreground 1 "Deleted."
+            deleted=$((deleted + 1))
+            last_selected=""
+            ;;
+          Keep)
+            gum style --foreground 2 "Kept."
+            kept=$((kept + 1))
+            ;;
+          Checkout)
+            git checkout "$branch"
+            gum style --foreground 2 "Switched to $branch."
+            exit 0
+            ;;
+          "Show full diff")
+            echo ""
+            git diff --color=always "$merge_base".."$branch" | head -200 || true
+            diff_total=$(git diff "$merge_base".."$branch" | wc -l | tr -d ' ' || true)
+            if [ "$diff_total" -gt 200 ]; then
+              gum style --foreground 3 "... ($((diff_total - 200)) more lines, showing first 200)"
+            fi
+            echo ""
+            # Re-prompt after showing diff
+            action2=$(gum choose "Keep" "Delete" "Checkout" "Quit" --header "What to do with this branch?" || true)
+            [[ -z "$action2" ]] && break
+            case "$action2" in
+              Delete)
+                git branch -D "$branch" > /dev/null
+                gum style --foreground 1 "Deleted."
+                deleted=$((deleted + 1))
+                last_selected=""
+                ;;
+              Keep)
+                gum style --foreground 2 "Kept."
+                kept=$((kept + 1))
+                ;;
+              Checkout)
+                git checkout "$branch"
+                gum style --foreground 2 "Switched to $branch."
+                exit 0
+                ;;
+              Quit)
+                quit_branches=true
+                break
+                ;;
+            esac
+            ;;
+          Quit)
+            quit_branches=true
+            break
+            ;;
+        esac
+      done
+
+      [[ "$quit_branches" == true ]] && break
     done
 
-    echo ""
-    gum style --bold "Branch review done: $deleted deleted, $kept kept."
+    if [ "$deleted" -gt 0 ] || [ "$kept" -gt 0 ]; then
+      echo ""
+      gum style --bold "Branch review done: $deleted deleted, $kept kept."
+    fi
   fi
 done
