@@ -16,6 +16,35 @@ short_age() {
   echo "$1" | sed -E -e 's/ years?/y/g' -e 's/ months?/mo/g' -e 's/ weeks?/w/g' -e 's/ days?/d/g' -e 's/ hours?/h/g' -e 's/ minutes?/min/g' -e 's/ seconds?/s/g' -e 's/ ago//' -e 's/, / /g'
 }
 
+# Path of the worktree a branch is checked out in, or empty if none.
+worktree_path_for() {
+  git worktree list --porcelain 2>/dev/null \
+    | awk -v b="refs/heads/$1" '/^worktree / { wt = substr($0, 10) } $0 == "branch " b { print wt; exit }' \
+    || true
+}
+
+# Delete a branch, first removing its worktree if it has one. A branch checked
+# out in a worktree cannot be deleted with `git branch -D` — that error would
+# otherwise kill the whole script via `set -e`. Returns non-zero on failure
+# instead of exiting; never forces (a dirty/locked worktree is left untouched).
+delete_branch() {
+  local b="$1" wt
+  wt=$(worktree_path_for "$b")
+  if [ -n "$wt" ]; then
+    if ! git worktree remove "$wt" 2>/dev/null; then
+      gum style --foreground 1 "Worktree has uncommitted changes or is locked — nothing deleted."
+      gum style --faint "  To force: git worktree remove --force '$wt' && git branch -D '$b'"
+      return 1
+    fi
+  fi
+  if git branch -D "$b" >/dev/null 2>&1; then
+    gum style --foreground 1 "Deleted."
+    return 0
+  fi
+  gum style --foreground 1 "Could not delete $b."
+  return 1
+}
+
 MAIN_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
 MAIN_BRANCH="${MAIN_BRANCH:-master}"
 current_branch=$(git symbolic-ref --short HEAD)
@@ -134,6 +163,9 @@ while true; do
       last_display=""
       last_name=""
 
+      # Branches currently checked out in a worktree (can't be deleted normally)
+      wt_branches=$(git worktree list --porcelain 2>/dev/null | sed -n 's|^branch refs/heads/||p' || true)
+
       # Find max branch name length for alignment
       max_len=0
       for b in "${branches[@]}"; do
@@ -171,6 +203,10 @@ while true; do
           fi
         else
           b_remote_status="local"
+        fi
+
+        if printf '%s\n' "$wt_branches" | grep -qxF "$b"; then
+          b_status="WORKTREE"
         fi
 
         line=$(printf "%-${max_len}s  %-14s  %-12s  %s" "$b" "$b_age" "$b_status" "$b_remote_status")
@@ -272,6 +308,9 @@ while true; do
           remote_status="local only"
         fi
 
+        # Worktree
+        branch_worktree=$(worktree_path_for "$branch")
+
         # Stashes
         stash_lines=$(git stash list | grep "on ${branch}:" || true)
         stash_count=0
@@ -285,6 +324,9 @@ while true; do
         gum style --foreground "$status_color" "  Status:      $status"
         echo "  Last commit: $branch_date ($branch_age)"
         echo "  Remote:      $remote_status"
+        if [ -n "$branch_worktree" ]; then
+          gum style --foreground 6 "  Worktree:    $branch_worktree"
+        fi
         if [ "$stash_count" -gt 0 ]; then
           gum style --foreground 6 "  Stashes: $stash_count"
         fi
@@ -310,15 +352,19 @@ while true; do
 
         # ── Action ──
 
-        action=$(gum choose "Keep" "Delete" "Checkout" "Show full diff" "Quit" --header "What to do with this branch?" || true)
+        if [ -n "$branch_worktree" ]; then
+          action=$(gum choose "Keep" "Remove worktree + branch" "Show full diff" "Quit" --header "What to do with this branch?" || true)
+        else
+          action=$(gum choose "Keep" "Delete" "Checkout" "Show full diff" "Quit" --header "What to do with this branch?" || true)
+        fi
         [[ -z "$action" ]] && break
 
         case "$action" in
-          Delete)
-            git branch -D "$branch" > /dev/null
-            gum style --foreground 1 "Deleted."
-            deleted=$((deleted + 1))
-            last_selected=""
+          Delete | "Remove worktree + branch")
+            if delete_branch "$branch"; then
+              deleted=$((deleted + 1))
+              last_selected=""
+            fi
             ;;
           Keep)
             gum style --foreground 2 "Kept."
@@ -338,14 +384,18 @@ while true; do
             fi
             echo ""
             # Re-prompt after showing diff
-            action2=$(gum choose "Keep" "Delete" "Checkout" "Quit" --header "What to do with this branch?" || true)
+            if [ -n "$branch_worktree" ]; then
+              action2=$(gum choose "Keep" "Remove worktree + branch" "Quit" --header "What to do with this branch?" || true)
+            else
+              action2=$(gum choose "Keep" "Delete" "Checkout" "Quit" --header "What to do with this branch?" || true)
+            fi
             [[ -z "$action2" ]] && break
             case "$action2" in
-              Delete)
-                git branch -D "$branch" > /dev/null
-                gum style --foreground 1 "Deleted."
-                deleted=$((deleted + 1))
-                last_selected=""
+              Delete | "Remove worktree + branch")
+                if delete_branch "$branch"; then
+                  deleted=$((deleted + 1))
+                  last_selected=""
+                fi
                 ;;
               Keep)
                 gum style --foreground 2 "Kept."
