@@ -2,8 +2,9 @@
 # Git cleanup script with interactive menus (requires gum).
 #
 # Modes:
-#   1. Stash cleanup — review stashes one by one (show diff, drop or keep)
-#   2. Branch cleanup — delete empty and merged branches
+#   1. Delete merged branches — find every branch already in main, delete in bulk
+#   2. Branch cleanup — review branches one by one
+#   3. Stash cleanup — review stashes one by one (show diff, drop or keep)
 
 set -euo pipefail
 
@@ -12,8 +13,19 @@ if ! command -v gum &> /dev/null; then
   exit 1
 fi
 
+# Shorten git's relative date into the variable named $1: "2 years, 3 months ago"
+# becomes "2y 3mo". Pure bash — it runs once per branch.
 short_age() {
-  echo "$1" | sed -E -e 's/ years?/y/g' -e 's/ months?/mo/g' -e 's/ weeks?/w/g' -e 's/ days?/d/g' -e 's/ hours?/h/g' -e 's/ minutes?/min/g' -e 's/ seconds?/s/g' -e 's/ ago//' -e 's/, / /g'
+  local s="${2% ago}"
+  s="${s//, / }"
+  s="${s// years/y}";     s="${s// year/y}"
+  s="${s// months/mo}";   s="${s// month/mo}"
+  s="${s// weeks/w}";     s="${s// week/w}"
+  s="${s// days/d}";      s="${s// day/d}"
+  s="${s// hours/h}";     s="${s// hour/h}"
+  s="${s// minutes/min}"; s="${s// minute/min}"
+  s="${s// seconds/s}";   s="${s// second/s}"
+  printf -v "$1" '%s' "$s"
 }
 
 # Path of the worktree a branch is checked out in, or empty if none.
@@ -45,8 +57,179 @@ delete_branch() {
   return 1
 }
 
-MAIN_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
-MAIN_BRANCH="${MAIN_BRANCH:-master}"
+# Branches never offered for automatic deletion (besides main and the current branch).
+PROTECTED_BRANCHES="main master develop"
+
+# Fetch, then set what "merged" is checked against: MERGE_TARGETS (local main
+# and origin/main, whichever exist) and MAIN_REF (the freshest of them).
+# Returns non-zero if neither main ref exists.
+prepare_merge_checks() {
+  local ref
+  if git remote get-url origin &>/dev/null; then
+    if ! gum spin --title "Fetching origin..." -- git fetch --prune --quiet origin; then
+      gum style --foreground 3 "Fetch failed — checking against local refs only."
+    fi
+  fi
+
+  MERGE_TARGETS=()
+  MAIN_REF=""
+  for ref in "refs/heads/$MAIN_BRANCH" "refs/remotes/origin/$MAIN_BRANCH"; do
+    if git show-ref --verify --quiet "$ref"; then
+      MERGE_TARGETS+=("$ref")
+      MAIN_REF="$ref"
+    fi
+  done
+  if [ -z "$MAIN_REF" ]; then
+    gum style --foreground 1 "Neither $MAIN_BRANCH nor origin/$MAIN_BRANCH exists."
+    return 1
+  fi
+}
+
+# Print merged GitHub PRs whose head branch is one of the given names, as
+# "<head sha> <number> <branch> <title>" lines. Asks GitHub for exactly these
+# branches — one GraphQL query per 100, run in parallel — rather than paging
+# through every merged PR. Prints nothing without gh or a GitHub remote.
+fetch_merged_prs() {
+  local dir q="" n=0 b
+  if [ $# -eq 0 ] || ! command -v gh &>/dev/null; then
+    return 0
+  fi
+  dir=$(mktemp -d)
+  for b in "$@"; do
+    q+="b$n:pullRequests(headRefName:\"${b//\"/\\\"}\",states:MERGED,first:20,orderBy:{field:CREATED_AT,direction:DESC}){nodes{headRefOid number headRefName title}} "
+    n=$((n + 1))
+    if (( n % 100 == 0 || n == $# )); then
+      gh api graphql -F owner='{owner}' -F name='{repo}' \
+        -f query="query(\$owner:String!,\$name:String!){repository(owner:\$owner,name:\$name){$q}}" \
+        --jq '.data.repository[].nodes[] | "\(.headRefOid) \(.number) \(.headRefName) \(.title)"' \
+        > "$dir/$n" 2>/dev/null &
+      q=""
+    fi
+  done
+  wait
+  cat "$dir"/* 2>/dev/null || true
+  rm -rf "$dir"
+}
+
+# Scan every local branch except main and the current one, newest first, into
+# the parallel SCAN_* arrays. A single for-each-ref call covers age, upstream,
+# worktree and commits ahead of main for all branches; only branches not plainly
+# contained in main get the PR and squash checks, run in parallel. Sets
+# MERGED_PRS (see fetch_merged_prs). Needs prepare_merge_checks.
+scan_branches() {
+  local fmt target b sha age short wt remote track ab1 ab2 i reason
+  local cand_names=() cand_args=()
+  fmt='%(refname:lstrip=2)%1f%(objectname)%1f%(committerdate:relative)%1f%(worktreepath)%1f%(upstream:remotename)%1f%(upstream:track)'
+  for target in "${MERGE_TARGETS[@]}"; do
+    fmt="$fmt%1f%(ahead-behind:$target)"
+  done
+
+  SCAN_NAMES=()
+  SCAN_AGES=()
+  SCAN_AHEAD=()
+  SCAN_REASONS=()
+  SCAN_REMOTES=()
+  SCAN_WORKTREES=()
+  while IFS=$'\x1f' read -r b sha age wt remote track ab1 ab2; do
+    if [[ "$b" == "$MAIN_BRANCH" || "$b" == "$current_branch" ]]; then
+      continue
+    fi
+    # ab1/ab2 are "<ahead> <behind>" per merge target; nothing ahead = contained in it
+    reason=""
+    if [[ "${ab1%% *}" == 0 || "${ab2%% *}" == 0 ]]; then
+      reason="merged"
+    else
+      cand_names+=("$b")
+      cand_args+=("${#SCAN_NAMES[@]}" "$b" "$sha")
+    fi
+    if [ -z "$remote" ]; then
+      remote="local"
+    elif [ "$track" = "[gone]" ]; then
+      remote="remote gone"
+    fi
+    ab2="${ab2:-$ab1}"
+    short_age short "$age"
+    SCAN_NAMES+=("$b")
+    SCAN_AGES+=("$short")
+    SCAN_AHEAD+=("${ab2%% *}")
+    SCAN_REASONS+=("$reason")
+    SCAN_REMOTES+=("$remote")
+    SCAN_WORKTREES+=("$wt")
+  done < <(git for-each-ref --sort=-committerdate --format="$fmt" refs/heads)
+
+  MERGED_PRS=""
+  if [ ${#cand_names[@]} -gt 0 ]; then
+    printf '\r\033[KFetching merged PRs from GitHub...' >&2
+    MERGED_PRS=$(fetch_merged_prs "${cand_names[@]}")
+
+    # merged_reason spawns several git processes per branch — spread them over all cores
+    printf '\r\033[KChecking %d branches for PR and squash merges...' "${#cand_names[@]}" >&2
+    export -f merged_reason
+    export MAIN_REF MERGED_PRS
+    while IFS=$'\t' read -r i reason; do
+      if [ -n "$i" ]; then
+        SCAN_REASONS[$i]="$reason"
+      fi
+    done < <(printf '%s\0' "${cand_args[@]}" \
+      | xargs -0 -n 3 -P "$(getconf _NPROCESSORS_ONLN)" "$BASH" -c \
+        'if r=$(merged_reason "$2" "$3"); then printf "%s\t%s\n" "$1" "$r"; fi' _)
+    printf '\r\033[K' >&2
+  fi
+}
+
+# Drop a deleted branch from the scan results (indices of the rest stay valid).
+forget_scanned() {
+  unset "SCAN_NAMES[$1]" "SCAN_AGES[$1]" "SCAN_AHEAD[$1]" "SCAN_REASONS[$1]" "SCAN_REMOTES[$1]" "SCAN_WORKTREES[$1]"
+}
+
+# Print why a branch not contained in main still counts as merged — "PR #N" or
+# "squash-merged" — or return non-zero if it doesn't. Cheapest checks first.
+# Runs in parallel child shells, so it only reads the exported MAIN_REF and
+# MERGED_PRS (see prepare_merge_checks and fetch_merged_prs).
+merged_reason() {
+  local b="$1" sha="$2" pr_sha pr_number mb f tmp files=()
+
+  # A merged GitHub PR whose head is (or contains) the branch tip. Matching on
+  # the sha, not just the name, keeps branches with commits added after the merge.
+  while read -r pr_sha pr_number; do
+    if [ "$pr_sha" = "$sha" ] || git merge-base --is-ancestor "$sha" "$pr_sha" 2>/dev/null; then
+      echo "PR #$pr_number"
+      return 0
+    fi
+  done < <(printf '%s\n' "$MERGED_PRS" | awk -v b="$b" '$3 == b { print $1, $2 }')
+
+  mb=$(git merge-base "$MAIN_REF" "$b" 2>/dev/null) || return 1
+
+  # Squash merge: every file the branch changed is identical in main
+  while IFS= read -r -d '' f; do
+    files+=("$f")
+  done < <(git diff --name-only -z "$mb" "$b" 2>/dev/null)
+  [ ${#files[@]} -eq 0 ] && return 1
+  if git --literal-pathspecs diff --quiet "$b" "$MAIN_REF" -- "${files[@]}" 2>/dev/null; then
+    echo "squash-merged"
+    return 0
+  fi
+
+  # Squash merge that main has changed since: the branch's combined diff
+  # matches a commit on main (patch-id comparison via a throwaway commit)
+  tmp=$(git commit-tree "$b^{tree}" -p "$mb" -m "git-cleanup squash check" 2>/dev/null) || return 1
+  if [[ "$(git cherry "$MAIN_REF" "$tmp" 2>/dev/null)" == -* ]]; then
+    echo "squash-merged"
+    return 0
+  fi
+  return 1
+}
+
+# Main branch: what origin/HEAD points to, else a local main, else master
+MAIN_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
+MAIN_BRANCH="${MAIN_BRANCH#origin/}"
+if [ -z "$MAIN_BRANCH" ]; then
+  if git show-ref --verify --quiet refs/heads/main; then
+    MAIN_BRANCH=main
+  else
+    MAIN_BRANCH=master
+  fi
+fi
 current_branch=$(git symbolic-ref --short HEAD)
 
 while true; do
@@ -57,6 +240,7 @@ while true; do
 
   echo ""
   mode=$(gum choose \
+    "Delete merged branches" \
     "Branch cleanup ($branch_count branches)" \
     "Stash cleanup ($stash_count stashes)" \
     "Exit" \
@@ -66,6 +250,69 @@ while true; do
 
   if [[ -z "$mode" || "$mode" == Exit ]]; then
     break
+  fi
+
+  # ─── Delete Merged Branches ───────────────────────────────────────────
+
+  if [[ "$mode" == "Delete merged"* ]]; then
+    prepare_merge_checks || continue
+    scan_branches
+
+    # Merged branches, minus protected ones and those checked out in a worktree
+    merged_idx=()
+    worktree_merged=()
+    max_len=0
+    for i in "${!SCAN_NAMES[@]}"; do
+      b="${SCAN_NAMES[$i]}"
+      if [ -z "${SCAN_REASONS[$i]}" ] || [[ " $PROTECTED_BRANCHES " == *" $b "* ]]; then
+        continue
+      fi
+      # Worktrees may be in active use — leave them to the one-by-one review
+      if [ -n "${SCAN_WORKTREES[$i]}" ]; then
+        worktree_merged+=("$b")
+        continue
+      fi
+      merged_idx+=("$i")
+      (( ${#b} > max_len )) && max_len=${#b}
+    done
+
+    if [ ${#worktree_merged[@]} -gt 0 ]; then
+      gum style --foreground 3 "Skipped merged branches checked out in a worktree (use Branch cleanup to remove them):"
+      printf '  %s\n' "${worktree_merged[@]}"
+    fi
+    if [ ${#merged_idx[@]} -eq 0 ]; then
+      gum style --foreground 2 "No merged branches to delete."
+      continue
+    fi
+
+    # All preselected: Enter deletes everything, deselect branches to keep
+    header=$(printf "%d merged branches — deselect any to keep, enter deletes the selected\n\n    %-${max_len}s  %-10s  %s" \
+      "${#merged_idx[@]}" "Branch" "Age" "Reason")
+    selected=$(for i in "${merged_idx[@]}"; do
+        printf "%-${max_len}s  %-10s  %s\t%s\n" "${SCAN_NAMES[$i]}" "${SCAN_AGES[$i]}" "${SCAN_REASONS[$i]}" "${SCAN_NAMES[$i]}"
+      done | gum choose --no-limit --selected='*' --label-delimiter=$'\t' --height 20 --header "$header" || true)
+    if [ -z "$selected" ]; then
+      gum style --foreground 3 "Nothing deleted."
+      continue
+    fi
+
+    deleted=0
+    failed=0
+    while IFS= read -r b; do
+      # Prints "Deleted branch <name> (was <sha>)." — the sha is enough to restore it
+      if git branch -D "$b"; then
+        deleted=$((deleted + 1))
+      else
+        failed=$((failed + 1))
+      fi
+    done <<< "$selected"
+
+    echo ""
+    gum style --bold "Deleted $deleted merged branches."
+    if [ "$failed" -gt 0 ]; then
+      gum style --foreground 1 "$failed could not be deleted (see errors above)."
+    fi
+    gum style --faint "To restore one: git branch <name> <sha>"
   fi
 
   # ─── Stash Cleanup ────────────────────────────────────────────────────
@@ -138,178 +385,101 @@ while true; do
   # ─── Branch Cleanup ───────────────────────────────────────────────────
 
   if [[ "$mode" == Branch* ]]; then
+    prepare_merge_checks || continue
+    # Scanned once; deletions below drop entries instead of re-scanning
+    scan_branches
     deleted=0
     kept=0
     last_selected=""
     quit_branches=false
 
     while true; do
-      # Collect all branches (refresh each iteration to reflect deletions)
-      branches=()
-      while IFS= read -r branch; do
-        branches+=("$branch")
-      done < <(git branch --format='%(refname:short)' | grep -v "^${MAIN_BRANCH}$" | grep -v "^${current_branch}$" | while read -r b; do
-        echo "$(git log -1 --format='%ct' "$b") $b"
-      done | sort -rn | cut -d' ' -f2-)
-
-      if [ ${#branches[@]} -eq 0 ]; then
+      if [ ${#SCAN_NAMES[@]} -eq 0 ]; then
         gum style --foreground 2 "No branches to review."
         break
       fi
 
-      # Build branch list with summary info, last-selected branch first
-      branch_display=()
-      branch_names=()
-      last_display=""
-      last_name=""
-
-      # Branches currently checked out in a worktree (can't be deleted normally)
-      wt_branches=$(git worktree list --porcelain 2>/dev/null | sed -n 's|^branch refs/heads/||p' || true)
-
-      # Find max branch name length for alignment
       max_len=0
-      for b in "${branches[@]}"; do
+      for b in "${SCAN_NAMES[@]}"; do
         (( ${#b} > max_len )) && max_len=${#b}
       done
 
-      for b in "${branches[@]}"; do
-        b_age=$(short_age "$(git log -1 --format="%ar" "$b" 2>/dev/null || echo "unknown")")
-        b_merge_base=$(git merge-base "$MAIN_BRANCH" "$b" 2>/dev/null || echo "")
-        if [ -n "$b_merge_base" ]; then
-          b_commits=$(git log --oneline "$b_merge_base".."$b" | wc -l | tr -d ' ')
-          if git merge-base --is-ancestor "$b" "$MAIN_BRANCH" 2>/dev/null; then
-            b_status="MERGED"
-          elif [ "$b_commits" -eq 0 ]; then
-            b_status="EMPTY"
-          else
-            # Check for squash merge: are the branch's file changes already in main?
-            b_changed=$(git diff --name-only "$b_merge_base".."$b" 2>/dev/null)
-            if [ -n "$b_changed" ] && git diff --quiet "$b" "$MAIN_BRANCH" -- $b_changed 2>/dev/null; then
-              b_status="MERGED"
-            else
-              b_status="$b_commits commits"
-            fi
-          fi
-        else
-          b_commits=0
-          b_status="—"
-        fi
-        b_remote=$(git config "branch.${b}.remote" 2>/dev/null || true)
-        if [ -n "$b_remote" ]; then
-          if git rev-parse --verify "refs/remotes/${b_remote}/${b}" &>/dev/null; then
-            b_remote_status="origin"
-          else
-            b_remote_status="remote gone"
-          fi
-        else
-          b_remote_status="local"
-        fi
-
-        if printf '%s\n' "$wt_branches" | grep -qxF "$b"; then
+      # One "<row>\t<scan index>" line per branch, last-selected branch first
+      rows=""
+      for i in "${!SCAN_NAMES[@]}"; do
+        if [ -n "${SCAN_WORKTREES[$i]}" ]; then
           b_status="WORKTREE"
-        fi
-
-        line=$(printf "%-${max_len}s  %-14s  %-12s  %s" "$b" "$b_age" "$b_status" "$b_remote_status")
-        if [[ "$b" == "$last_selected" ]]; then
-          last_display="$line"
-          last_name="$b"
+        elif [ -n "${SCAN_REASONS[$i]}" ]; then
+          b_status="MERGED"
         else
-          branch_display+=("$line")
-          branch_names+=("$b")
+          b_status="${SCAN_AHEAD[$i]} commits"
+        fi
+        printf -v line "%-${max_len}s  %-14s  %-12s  %s\t%s" \
+          "${SCAN_NAMES[$i]}" "${SCAN_AGES[$i]}" "$b_status" "${SCAN_REMOTES[$i]}" "$i"
+        if [[ "$i" == "$last_selected" ]]; then
+          rows="$line"$'\n'"$rows"
+        else
+          rows="$rows$line"$'\n'
         fi
       done
-      if [[ -n "$last_display" ]]; then
-        branch_display=("$last_display" "${branch_display[@]}")
-        branch_names=("$last_name" "${branch_names[@]}")
-      fi
 
       header=$(printf "  %-${max_len}s  %-14s  %-12s  %s" "Branch" "Age" "Status" "Remote")
-      selected=$(printf '%s\n' "Review all branches" "${branch_display[@]}" \
-        | gum choose --header "$header" || true)
+      selected=$(printf 'Review all branches\tall\n%s' "$rows" \
+        | gum choose --label-delimiter=$'\t' --header "$header" || true)
       [[ -z "$selected" ]] && break
 
-      if [[ "$selected" == "Review all branches" ]]; then
-        review_branches=("${branches[@]}")
+      if [[ "$selected" == all ]]; then
+        review_idx=("${!SCAN_NAMES[@]}")
       else
-        # Match selection back to branch name by index
-        selected_branch=""
-        for j in "${!branch_display[@]}"; do
-          if [[ "${branch_display[$j]}" == "$selected" ]]; then
-            selected_branch="${branch_names[$j]}"
-            break
-          fi
-        done
-        review_branches=("$selected_branch")
-        last_selected="$selected_branch"
+        review_idx=("$selected")
+        last_selected="$selected"
       fi
 
-      total=${#review_branches[@]}
+      total=${#review_idx[@]}
+      idx=0
 
-      for i in "${!review_branches[@]}"; do
-        branch="${review_branches[$i]}"
-        idx=$((i + 1))
+      for i in "${review_idx[@]}"; do
+        branch="${SCAN_NAMES[$i]}"
+        idx=$((idx + 1))
 
         # ── Gather info ──
 
         branch_date=$(git log -1 --format="%ad" --date=short "$branch")
         branch_age=$(git log -1 --format="%ar" "$branch")
 
-        merge_base=$(git merge-base "$MAIN_BRANCH" "$branch" 2>/dev/null || echo "")
+        merge_base=$(git merge-base "$MAIN_REF" "$branch" 2>/dev/null || echo "")
         if [ -z "$merge_base" ]; then
           continue
         fi
 
-        # Status
-        commit_count=$(git log --oneline "$merge_base".."$branch" | wc -l | tr -d ' ')
-        is_merged=false
-        if git merge-base --is-ancestor "$branch" "$MAIN_BRANCH" 2>/dev/null; then
-          is_merged=true
-        fi
-
-        if [ "$commit_count" -eq 0 ]; then
-          status="EMPTY"
-          status_color=3
-        elif [ "$is_merged" = true ]; then
-          status="MERGED"
-          status_color=3
-        else
-          # Check for squash merge: are the branch's file changes already in master?
-          changed_files=$(git diff --name-only "$merge_base".."$branch" 2>/dev/null)
-          if [ -n "$changed_files" ] && git diff --quiet "$branch" "$MAIN_BRANCH" -- $changed_files 2>/dev/null; then
+        # Status (from the scan)
+        commit_count="${SCAN_AHEAD[$i]}"
+        status_color=3
+        case "${SCAN_REASONS[$i]}" in
+          merged)
+            status="MERGED"
+            ;;
+          squash-merged)
             status="MERGED (squash)"
-            status_color=3
-          elif command -v gh &>/dev/null; then
-            # Ask GitHub if this branch has a merged PR
-            pr_info=$(gh pr list --head "$branch" --state merged --limit 1 --json number,title 2>/dev/null || echo "[]")
-            if [ "$pr_info" != "[]" ]; then
-              pr_number=$(echo "$pr_info" | sed -n 's/.*"number":\([0-9]*\).*/\1/p')
-              pr_title=$(echo "$pr_info" | sed -n 's/.*"title":"\([^"]*\)".*/\1/p')
-              status="MERGED via PR #${pr_number}: ${pr_title}"
-              status_color=3
-            else
-              status="ACTIVE ($commit_count commits)"
-              status_color=2
-            fi
-          else
+            ;;
+          "PR #"*)
+            pr_title=$(printf '%s\n' "$MERGED_PRS" \
+              | awk -v n="${SCAN_REASONS[$i]#PR #}" '$2 == n { sub(/^[^ ]+ [^ ]+ [^ ]+ /, ""); print; exit }')
+            status="MERGED via ${SCAN_REASONS[$i]}: $pr_title"
+            ;;
+          *)
             status="ACTIVE ($commit_count commits)"
             status_color=2
-          fi
-        fi
+            ;;
+        esac
 
-        # Remote
-        remote_ref=$(git config "branch.${branch}.remote" 2>/dev/null || true)
-        if [ -n "$remote_ref" ]; then
-          if git rev-parse --verify "refs/remotes/${remote_ref}/${branch}" &>/dev/null; then
-            remote_status="pushed to $remote_ref"
-          else
-            remote_status="remote deleted"
-          fi
-        else
-          remote_status="local only"
-        fi
+        case "${SCAN_REMOTES[$i]}" in
+          local) remote_status="local only" ;;
+          "remote gone") remote_status="remote deleted" ;;
+          *) remote_status="pushed to ${SCAN_REMOTES[$i]}" ;;
+        esac
 
-        # Worktree
-        branch_worktree=$(worktree_path_for "$branch")
+        branch_worktree="${SCAN_WORKTREES[$i]}"
 
         # Stashes
         stash_lines=$(git stash list | grep "on ${branch}:" || true)
@@ -364,6 +534,7 @@ while true; do
             if delete_branch "$branch"; then
               deleted=$((deleted + 1))
               last_selected=""
+              forget_scanned "$i"
             fi
             ;;
           Keep)
@@ -395,6 +566,7 @@ while true; do
                 if delete_branch "$branch"; then
                   deleted=$((deleted + 1))
                   last_selected=""
+                  forget_scanned "$i"
                 fi
                 ;;
               Keep)
