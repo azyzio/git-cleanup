@@ -258,38 +258,32 @@ while true; do
     prepare_merge_checks || continue
     scan_branches
 
-    # Merged branches, minus protected ones and those checked out in a worktree
+    # Merged branches, minus protected ones
     merged_idx=()
-    worktree_merged=()
+    worktree_count=0
     max_len=0
     for i in "${!SCAN_NAMES[@]}"; do
       b="${SCAN_NAMES[$i]}"
       if [ -z "${SCAN_REASONS[$i]}" ] || [[ " $PROTECTED_BRANCHES " == *" $b "* ]]; then
         continue
       fi
-      # Worktrees may be in active use — leave them to the one-by-one review
-      if [ -n "${SCAN_WORKTREES[$i]}" ]; then
-        worktree_merged+=("$b")
-        continue
-      fi
+      [ -n "${SCAN_WORKTREES[$i]}" ] && worktree_count=$((worktree_count + 1))
       merged_idx+=("$i")
       (( ${#b} > max_len )) && max_len=${#b}
     done
 
-    if [ ${#worktree_merged[@]} -gt 0 ]; then
-      gum style --foreground 3 "Skipped merged branches checked out in a worktree (use Branch cleanup to remove them):"
-      printf '  %s\n' "${worktree_merged[@]}"
-    fi
     if [ ${#merged_idx[@]} -eq 0 ]; then
       gum style --foreground 2 "No merged branches to delete."
       continue
     fi
 
     # All preselected: Enter deletes everything, deselect branches to keep
-    header=$(printf "%d merged branches — deselect any to keep, enter deletes the selected\n\n    %-${max_len}s  %-10s  %s" \
-      "${#merged_idx[@]}" "Branch" "Age" "Reason")
+    header=$(printf "%d merged branches (%d in worktrees) — deselect any to keep, enter deletes the selected\n\n    %-${max_len}s  %-10s  %-13s  %s" \
+      "${#merged_idx[@]}" "$worktree_count" "Branch" "Age" "Reason" "Worktree")
     selected=$(for i in "${merged_idx[@]}"; do
-        printf "%-${max_len}s  %-10s  %s\t%s\n" "${SCAN_NAMES[$i]}" "${SCAN_AGES[$i]}" "${SCAN_REASONS[$i]}" "${SCAN_NAMES[$i]}"
+        wt="${SCAN_WORKTREES[$i]}"
+        [[ "$wt" == "$HOME"/* ]] && wt="~${wt#"$HOME"}"
+        printf "%-${max_len}s  %-10s  %-13s  %s\t%s\n" "${SCAN_NAMES[$i]}" "${SCAN_AGES[$i]}" "${SCAN_REASONS[$i]}" "$wt" "$i"
       done | gum choose --no-limit --selected='*' --label-delimiter=$'\t' --height 20 --header "$header" || true)
     if [ -z "$selected" ]; then
       gum style --foreground 3 "Nothing deleted."
@@ -298,7 +292,15 @@ while true; do
 
     deleted=0
     failed=0
-    while IFS= read -r b; do
+    worktrees_kept=0
+    while IFS= read -r i; do
+      b="${SCAN_NAMES[$i]}"
+      wt="${SCAN_WORKTREES[$i]}"
+      # Never forced: a worktree with uncommitted or untracked files keeps its branch
+      if [ -n "$wt" ] && ! git worktree remove "$wt"; then
+        worktrees_kept=$((worktrees_kept + 1))
+        continue
+      fi
       # Prints "Deleted branch <name> (was <sha>)." — the sha is enough to restore it
       if git branch -D "$b"; then
         deleted=$((deleted + 1))
@@ -309,6 +311,9 @@ while true; do
 
     echo ""
     gum style --bold "Deleted $deleted merged branches."
+    if [ "$worktrees_kept" -gt 0 ]; then
+      gum style --foreground 3 "$worktrees_kept kept: their worktree has uncommitted changes or is locked (see above). Review them in Branch cleanup."
+    fi
     if [ "$failed" -gt 0 ]; then
       gum style --foreground 1 "$failed could not be deleted (see errors above)."
     fi
