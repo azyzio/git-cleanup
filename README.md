@@ -28,4 +28,4 @@ The first menu option fetches `origin`, finds every local branch whose work is a
 - a merged GitHub PR has its exact tip as head (needs `gh`; branches with commits added after the merge are kept),
 - or it was squash-merged (its changes are already in main).
 
-Main/master/develop, the current branch, and branches checked out in a worktree are never deleted. Only local branches are removed; each deletion prints the old sha so it can be restored with `git branch <name> <sha>`.
+Main/master/develop and the current branch are never deleted. A merged branch checked out in a worktree is deleted together with its worktree, unless the worktree has uncommitted or untracked changes or is locked. In that case both are kept (the worktree is never force-removed). Only local branches are removed; each deletion prints the old sha so it can be restored with `git branch <name> <sha>`.
